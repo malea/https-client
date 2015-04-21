@@ -134,7 +134,6 @@ class HttpConnection : public Connection {
   protected:
     bool send_all(const string &packet, string *error) override;
     bool recv_one(string *packet, string *error) override;
-    bool recv(string *packet, string *error);
     string default_port() override {
       return "80";
     }
@@ -155,7 +154,6 @@ class HttpsConnection : public Connection {
   protected:
     bool send_all(const string &packet, string *error) override;
     bool recv_one(string *packet, string *error) override;
-    bool recv(string *packet, string *error);
     string default_port() override {
       return "443";
     }
@@ -651,19 +649,6 @@ bool HttpsConnection::recv_one(string *packet, string *error) {
   return true;
 }
 
-bool HttpsConnection::recv(string *packet, string *error) {
-  int size;
-  char buf[2048];
-
-  do {
-    size = BIO_read(conn_, buf, 2048);
-    if (size > 0) {
-      fwrite(buf, 1, size, stdout);
-    }
-  } while (size > 0 || BIO_should_retry(conn_));
-  return true;
-}
-
 bool HttpConnection::connect(
     const string &host,
     const string &port,
@@ -784,60 +769,6 @@ bool HttpConnection::recv_one(string *packet, string *error) {
     return false;
   }
   packet->assign(buffer, size);
-  return true;
-}
-
-bool HttpConnection::recv(string *packet, string *error) {
-  string backlog = "";
-  int content_length = -1;
-  const string pattern = "Content-Length: ";
-  // first get headers, line-by-line
-  while (true) {
-    string line, new_backlog;
-    get_line(sockfd_, backlog, line, new_backlog);
-    if (line == "") {
-      break;
-    }
-    // print header lines to stderr
-    cerr << line << endl;
-
-    // if line starts with "Content-Length: "
-    // parse it and put it in content_length
-    string maybe_content_length = line.substr(0,pattern.size());
-    if (maybe_content_length == pattern) {
-      content_length = atoi(line.substr(pattern.size()).c_str()); 
-    }
-
-    backlog = new_backlog;
-  }
-  // if Content-Length is not provided in response, inform and exit
-  if (content_length == -1) {
-    error->assign("Content-Length not provided in response!");
-    return false;
-  }
-  // print out blank line to separate headers (in stderr) from body (in stdout)
-  cout << endl; 
-
-  // now print out backlog
-  cout << backlog;
-
-  // now it is known exactly how much is left to receive, receive it in body_buf
-  int remaining_to_recv = content_length - backlog.size() + 1;
-  char body_buf[remaining_to_recv];
-
-  while (remaining_to_recv > 0) {
-    int ret = ::recv(sockfd_, body_buf, remaining_to_recv, 0);
-    if (ret < 0) {
-      error->assign("recv: " + get_perror());
-      return false;
-    }
-    if (ret == 0) {
-      break;
-    }
-    // print out body to stdout
-    fwrite(body_buf, sizeof(char), ret, stdout);
-    remaining_to_recv -= ret;
-  }
   return true;
 }
 
