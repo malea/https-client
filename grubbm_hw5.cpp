@@ -19,7 +19,8 @@
 #include <memory>
 #include <errno.h>
 
-#define DEBUG
+// Turn on debugging statements:
+// #define DEBUG
 
 using namespace std;
 
@@ -31,6 +32,10 @@ const char *openssl_strerror( ) {
 	return ERR_error_string(ERR_get_error(), NULL);
 }
 
+string get_sslerror() {
+  return string(openssl_strerror());
+}
+
 class Connection {
   public:
 
@@ -40,7 +45,8 @@ class Connection {
     // If error, returns false and sets `error`.
     static bool smart_get(
         const string &url,
-        string *response,
+        string *response_header,
+        string *response_body,
         string *error);
 
     // Initialize the connection.
@@ -60,13 +66,13 @@ class Connection {
 
   protected:
     // Send packet over the connection.
-    virtual bool send(const string &packet, string *error) {
+    virtual bool send_all(const string &packet, string *error) {
       error->assign("abstract - not implemented");
       return false;
     }
 
     // Receive packet over the connection.
-    virtual bool recv(string *packet, string *error) {
+    virtual bool recv_one(string *packet, string *error) {
       error->assign("abstract - not implemented");
       return false;
     }
@@ -75,14 +81,30 @@ class Connection {
       return "80";
     }
 
+    virtual bool should_retry() {
+      return false;
+    }
+
   private:
     // Choose the right connection subclass based on the url.
     static Connection *make_connection(const string &url);
 
+    // Receive packet over the connection.
+    bool recv_all(string *headers, string *body, string *error);
+
+    // Puts a complete line in line, including backlog,  and places the
+    // remaining content into the new_backlog
+    bool recv_line(
+        const string &backlog,
+        string *line,
+        string *new_backlog,
+        string *error);
+
     // Private implementation of `get` function.
     bool get(
         const string &url,
-        string *response,
+        string *response_header,
+        string *response_body,
         string *error);
 
     // Parse the given URL.
@@ -110,10 +132,14 @@ class HttpConnection : public Connection {
         string *error) override;
     bool close(string *error) override;
   protected:
-    bool send(const string &packet, string *error) override;
-    bool recv(string *packet, string *error) override;
+    bool send_all(const string &packet, string *error) override;
+    bool recv_one(string *packet, string *error) override;
+    bool recv(string *packet, string *error);
     string default_port() override {
       return "80";
+    }
+    bool should_retry() override {
+      return false;
     }
   private:
     int sockfd_;
@@ -127,11 +153,13 @@ class HttpsConnection : public Connection {
         string *error) override;
     bool close(string *error) override;
   protected:
-    bool send(const string &packet, string *error) override;
-    bool recv(string *packet, string *error) override;
+    bool send_all(const string &packet, string *error) override;
+    bool recv_one(string *packet, string *error) override;
+    bool recv(string *packet, string *error);
     string default_port() override {
       return "443";
     }
+    bool should_retry() override;
   private:
     SSL_CTX *ctx_;
     BIO *conn_;
@@ -212,7 +240,8 @@ bool Connection::construct_request(
 
 bool Connection::get(
     const string &url,
-    string *response,
+    string *response_header,
+    string *response_body,
     string *error) {
 
   string host;
@@ -250,7 +279,7 @@ bool Connection::get(
   cout << "==== </REQUEST> ====" << endl;
 #endif
 
-  if (!send(request, error)) {
+  if (!send_all(request, error)) {
     return false;
   }
 
@@ -258,17 +287,126 @@ bool Connection::get(
   cout << "Request sent to server." << endl;
 #endif
 
-  if (!recv(response, error)) {
+  if (!recv_all(response_header, response_body, error)) {
     return false;
   }
 
-#if 0
+#ifdef DEBUG
   cout << "Response received from server:" << endl;
   cout << "==== <RESPONSE> ====" << endl;
-  cout << *response;
+  cout << "---- <HEADER> ----" << endl;
+  cout << *response_header;
+  cout << "---- </HEADER> ----" << endl;
+  cout << "---- <BODY> ----" << endl;
+  cout << *response_body;
+  cout << "---- </BODY> ----" << endl;
   cout << "==== </RESPONSE> ====" << endl;
 #endif
 
+  return true;
+}
+
+bool Connection::recv_all(string *headers, string *body, string *error) {
+  headers->assign("");
+  body->assign("");
+
+  string backlog = "";
+  int content_length = -1;
+  const string pattern = "Content-Length: ";
+  // first get headers, line-by-line
+  while (true) {
+    string line, new_backlog;
+    if (!recv_line(backlog, &line, &new_backlog, error)) {
+      return false;
+    }
+
+    if (line == "") {
+      break;
+    }
+
+#ifdef DEBUG
+    cout << "Got a HEADER: " << line << endl;
+#endif
+
+    *headers += line + "\n";
+
+    // if line starts with "Content-Length: "
+    // parse it and put it in content_length
+    string maybe_content_length = line.substr(0,pattern.size());
+    if (maybe_content_length == pattern) {
+      content_length = atoi(line.substr(pattern.size()).c_str()); 
+    }
+
+    backlog = new_backlog;
+  }
+  // if Content-Length is not provided in response, inform and exit
+  if (content_length == -1) {
+    error->assign("Content-Length not provided in response!");
+    return false;
+  }
+
+  // now print out backlog
+  body->assign(backlog);
+
+  // now it is known exactly how much is left to receive, receive it in body_buf
+  int remaining_to_recv = content_length - backlog.size() + 1;
+  char body_buf[remaining_to_recv];
+
+  while (remaining_to_recv > 0) {
+    string packet;
+    if (!recv_one(&packet, error)) {
+      return false;
+    }
+    if (packet.size() == 0 && !should_retry()) {
+      break;
+    }
+    remaining_to_recv -= packet.size();
+    *body += packet;
+  }
+  return true;
+}
+
+bool Connection::recv_line(
+    const string &backlog,
+    string *line,
+    string *new_backlog,
+    string *error) {
+  // check to see if there is a line break in backlog
+  int end_of_line = backlog.find("\r\n");
+  // if there is, return that line
+  if (end_of_line != string::npos) {
+    line->assign(backlog.substr(0,end_of_line));
+    new_backlog->assign(backlog.substr(end_of_line + 2));
+    return true;
+  }
+
+  new_backlog->assign(backlog);
+
+  // otherwise, we have more the receive
+  string packet;
+  size_t newline_index;
+  while (true) {
+    if (!recv_one(&packet, error)) {
+      return false;
+    }
+
+    newline_index = packet.find("\r\n");
+    if (newline_index != string::npos) {
+      break; // we are done
+    }
+    *new_backlog += packet;
+
+  }
+
+  // first, set the line to the line we found
+  line->assign(*new_backlog + packet.substr(0, newline_index));
+  // then, handle the remaining received bytes and put them in new_backlog
+  size_t new_backlog_index = newline_index + 2;
+  if (new_backlog_index < packet.size()) {
+    new_backlog->assign(packet.substr(newline_index + 2));
+  } else {
+    new_backlog->assign("");
+  }
   return true;
 }
 
@@ -412,7 +550,8 @@ int check_certificate(BIO *conn, const char *hostname) {
 	subject_name = X509_get_subject_name(cert);
 	
 	/* and print it out */
-	X509_NAME_print_ex_fp(stderr, subject_name, 0, 0);
+  /* just kidding this is the homework */
+	// X509_NAME_print_ex_fp(stderr, subject_name, 0, 0);
 
 	/* loop through "common names" (hostnames) in cert */
 	pos = -1;
@@ -446,7 +585,7 @@ int check_certificate(BIO *conn, const char *hostname) {
 	if (hostname_match) {
 		return 0;
 	} else {
-		fprintf(stderr, "hostnames do not match!\n");
+		fprintf(stderr, " hostnames do not match!\n");
 		return -1;
 	}
 }
@@ -486,8 +625,29 @@ bool HttpsConnection::close(string *error) {
   return true;
 }
 
-bool HttpsConnection::send(const string &packet, string *error) {
+bool HttpsConnection::should_retry() {
+  return BIO_should_retry(conn_);
+}
+
+bool HttpsConnection::send_all(const string &packet, string *error) {
   BIO_puts(conn_, packet.c_str());
+  return true;
+}
+
+bool HttpsConnection::recv_one(string *packet, string *error) {
+  int size;
+  char buf[1024];
+  size = BIO_read(conn_, buf, sizeof(buf));
+  if (size < 0) {
+    if (should_retry()) {
+      packet->assign("");
+      return true;
+    } else {
+      error->assign("BIO_read: " + get_sslerror());
+      return false;
+    }
+  }
+  packet->assign(buf, size);
   return true;
 }
 
@@ -553,7 +713,7 @@ bool HttpConnection::close(string *error) {
   return true;
 }
 
-bool HttpConnection::send(const string &packet, string *error) {
+bool HttpConnection::send_all(const string &packet, string *error) {
   ssize_t ret, sent = 0;
   size_t size = packet.size();
   int flags = 0;
@@ -614,6 +774,17 @@ void get_line(int fd, string backlog, string &line, string &new_backlog) {
   else {
     new_backlog = "";
   }
+}
+
+bool HttpConnection::recv_one(string *packet, string *error) {
+  char buffer[1024];
+  size_t size = ::recv(sockfd_, buffer, sizeof(buffer), 0);
+  if (size < 0) {
+    error->assign("recv: " + get_perror());
+    return false;
+  }
+  packet->assign(buffer, size);
+  return true;
 }
 
 bool HttpConnection::recv(string *packet, string *error) {
@@ -686,10 +857,11 @@ Connection *Connection::make_connection(const string &url) {
 
 bool Connection::smart_get(
     const string &url,
-    string *response,
+    string *response_header,
+    string *response_body,
     string *error) {
   unique_ptr<Connection> conn(make_connection(url));
-  conn->get(url, response, error);
+  return conn->get(url, response_header, response_body, error);
 }
 
 int main(int argc, char *argv []) {
@@ -699,16 +871,23 @@ int main(int argc, char *argv []) {
   }
   
   string url(argv[1]);
-  string response;
+  string response_header;
+  string response_body;
   string error;
 
-  bool success = Connection::smart_get(url, &response, &error);
+  bool success = Connection::smart_get(
+      url,
+      &response_header,
+      &response_body,
+      &error);
 
   if (!success) {
-    cerr << error << endl;
+    cerr << "Error: " << error << endl;
     return EXIT_FAILURE;
   }
 
-  cout << response << endl;
+  cerr << response_header << endl;
+  cout << response_body << endl;
+
   return EXIT_SUCCESS;
 }
