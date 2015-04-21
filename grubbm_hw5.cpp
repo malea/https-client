@@ -718,49 +718,6 @@ bool HttpConnection::send_all(const string &packet, string *error) {
   return true;
 }
 
-/* This function receives from the socket and puts a complete line in line and places
-   the remaining content into the backlog */
-void get_line(int fd, string backlog, string &line, string &new_backlog) {
-  // check to see if there is a line break in backlog
-  int end_of_line = backlog.find("\r\n");
-  // if there is, return that line
-  if (end_of_line != string::npos) {
-    line = backlog.substr(0,end_of_line);
-    new_backlog = backlog.substr(end_of_line + 2);
-    return;
-  }
-  char buff[1024];
-  char *rest;
-  int buffsize;
-  new_backlog = backlog;
-  // otherwise, we have more the receive
-  while (true) {
-    buffsize = recv(fd, buff, sizeof(buff), 0);
-    if (buffsize < 0) {
-      perror("recv");
-      exit(1);
-    }
-    // check for line break
-    rest = strstr(buff, "\r\n");
-    if (rest != NULL) {
-      break; // we are done
-    }
-    // if no line break, add buff to the new backlog
-    new_backlog += string(buff); 
-  }
-  rest[0] = '\0';
-  // first, set the line to the line we found
-  line = new_backlog + string(buff);
-  // then, handle the remaining received bytes and put them in new_backlog
-  int length_of_rest = buffsize - strlen(buff) - 2;
-  if (length_of_rest >= 1) {
-    new_backlog = string(rest + 2, length_of_rest);
-  }
-  else {
-    new_backlog = "";
-  }
-}
-
 bool HttpConnection::recv_one(string *packet, string *error) {
   char buffer[1024];
   size_t size = ::recv(sockfd_, buffer, sizeof(buffer), 0);
