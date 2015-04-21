@@ -8,6 +8,8 @@ Or:
 
     make
 
+Use the included makefile.
+
 ## To Run
 
     ./a.out http://www.URLHERE:PORTHERE/PATHHERE/
